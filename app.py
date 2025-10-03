@@ -1,74 +1,46 @@
-import os
+import os, traceback
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from ai import build_system_prompt, chat_completion
+from ai import SYSTEM_PROMPT, chat_completion
+from utils import log_lead
 
 app = Flask(__name__)
 
-BOT_WHATSAPP_NUMBER = os.getenv("BOT_WHATSAPP_NUMBER", "+14155238886")
-BOT_FIRST_CODE = os.getenv("BOT_FIRST_CODE", "THRYVIX2025")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "6"))  # messages (per role) to keep
+MAX_TURNS = 6  # user+assistant pairs to keep
+sessions = {}  # phone -> [{"role":..., "content":...}, ...]
 
-# In-memory sessions: phone -> {'messages': [...], 'sent_header': bool}
-SESSIONS = {}
+def get_history(phone):
+    if phone not in sessions:
+        sessions[phone] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    return sessions[phone]
 
-def session_for(phone: str):
-    if phone not in SESSIONS:
-        SESSIONS[phone] = {"messages": [], "sent_header": False}
-    return SESSIONS[phone]
-
-def trim_history(msgs):
-    # Keep last MAX_HISTORY*2 messages (user+assistant), excluding the system
-    base = [m for m in msgs if m["role"] != "system"]
-    if len(base) <= MAX_HISTORY * 2:
-        return msgs
-    # Keep system plus tail of base
-    system = [m for m in msgs if m["role"] == "system"][:1]
-    tail = base[-MAX_HISTORY*2:]
-    return system + tail
+def trim(history):
+    sys = [m for m in history if m["role"] == "system"][:1]
+    rest = [m for m in history if m["role"] != "system"]
+    tail = rest[-2*MAX_TURNS:]
+    return sys + tail
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
-    user_text = (request.values.get("Body") or "").strip()
-    wa_from = request.values.get("From", "")  # e.g., whatsapp:+91...
+    phone = request.values.get("From", "")
+    text = (request.values.get("Body") or "").strip()
+    history = get_history(phone)
+    history.append({"role": "user", "content": text})
+    history[:] = trim(history)
 
-    sess = session_for(wa_from)
-
-    # Build/ensure system prompt
-    system_msg = {"role": "system", "content": build_system_prompt(BOT_WHATSAPP_NUMBER, BOT_FIRST_CODE)}
-    if not any(m.get("role") == "system" for m in sess["messages"]):
-        sess["messages"].insert(0, system_msg)
-
-    # If this is the first assistant reply ever for this number, we pass a hint token
-    if not sess["sent_header"]:
-        # Add a one-time assistant 'tool' hint so the model knows it's first reply
-        sess["messages"].append({"role": "system", "content": "First assistant reply in this conversation: include header."})
-
-    # Add user message
-    sess["messages"].append({"role": "user", "content": user_text})
-    sess["messages"] = trim_history(sess["messages"])
-
-    # Get AI reply
     try:
-        ai_text = chat_completion(sess["messages"])
+        ai_text = chat_completion(history)
+        history.append({"role": "assistant", "content": ai_text})
+        history[:] = trim(history)
     except Exception as e:
-        # Fallback minimal reply
-        ai_text = (
-            f"📞 WhatsApp: {BOT_WHATSAPP_NUMBER}\n🔑 Code: {BOT_FIRST_CODE}\n"
-            "Thanks for reaching out! Could you tell me your business type and city?"
-            if not sess["sent_header"] else
-            "Thanks! Please share your business type and city so I can plan a quick demo."
-        )
+        traceback.print_exc()
+        ai_text = "Thanks! Could you tell me your business type and city so I can plan a quick demo?"
 
-    # After first successful assistant message, mark header sent
-    if not sess["sent_header"]:
-        sess["sent_header"] = True
+    try:
+        log_lead(phone, text, ai_text)
+    except Exception:
+        traceback.print_exc()
 
-    # Save assistant message to history
-    sess["messages"].append({"role": "assistant", "content": ai_text})
-    sess["messages"] = trim_history(sess["messages"])
-
-    # Return to Twilio
     resp = MessagingResponse()
     resp.message(ai_text)
     return str(resp)
